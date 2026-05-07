@@ -1,0 +1,37 @@
+[project]
+name = "openfold-mmseqs-wrapper"
+version = "0.1.0"
+description = "Local-MMseqs2 + Apple-Silicon-MLX wrapper around OpenFold 3"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6",
+]
+authors = [
+    { name = "Pavel Yakovlev", email = "pavel@yakovlev.me" },
+]
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.urls]
+Repository = "https://github.com/zmactep/openfold-mac-tool"
+
+[project.scripts]
+openfold = "openfold:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Single-file module layout: openfold.py lives next to pyproject.toml.
+[tool.hatch.build.targets.wheel]
+only-include = ["openfold.py"]
