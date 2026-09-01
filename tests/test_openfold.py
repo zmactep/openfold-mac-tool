@@ -182,15 +182,23 @@ class OpenFoldWrapperTests(unittest.TestCase):
             chains = {chain["chain_ids"]: chain for chain in query_cfg["chains"]}
             self.assertIn("paired_msa_file_paths", chains["A"])
             self.assertIn("paired_msa_file_paths", chains["B"])
-            self.assertNotIn("paired_msa_file_paths", chains["C"])
+            self.assertIn("paired_msa_file_paths", chains["C"])
             self.assertTrue(chains["C"]["main_msa_file_paths"].endswith("query_only.a3m"))
 
             paired_a = Path(chains["A"]["paired_msa_file_paths"]).read_text()
             paired_b = Path(chains["B"]["paired_msa_file_paths"]).read_text()
+            paired_c = Path(chains["C"]["paired_msa_file_paths"]).read_text()
             self.assertEqual(paired_a.count(">"), 3)
             self.assertEqual(paired_b.count(">"), 3)
+            self.assertEqual(paired_c.count(">"), 3)
             self.assertIn("OX9606", paired_a)
             self.assertIn("OX10090", paired_b)
+            self.assertEqual(
+                paired_c,
+                ">C\nHIK\n"
+                ">pair_00001_OX9606\n---\n"
+                ">pair_00002_OX10090\n---\n",
+            )
 
             runner = yaml.safe_load((output_dir / "runner.yml").read_text())
             msa = runner["dataset_config_kwargs"]["msa"]

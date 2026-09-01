@@ -208,6 +208,25 @@ def write_query_only_a3m(seq: str, chain_dir: Path, tag: str) -> Path:
     return path
 
 
+def write_gap_only_paired_a3m(
+    seq: str, chain_dir: Path, tag: str, paired_template_path: Path
+) -> Path:
+    """Keep an MSA-disabled protein aligned with precomputed paired rows."""
+    template_records = read_a3m_records(paired_template_path)
+    if len(template_records) < 2:
+        raise RuntimeError(f"Paired MSA contains no paired rows: {paired_template_path}")
+
+    gap_sequence = "-" * len(seq)
+    records = [(tag, seq)]
+    records.extend((header, gap_sequence) for header, _sequence in template_records[1:])
+
+    chain_dir.mkdir(parents=True, exist_ok=True)
+    path = chain_dir / f"{PAIRED_MSA_NAME}.a3m"
+    write_a3m_records(path, records)
+    validate_a3m(path, query_sequence=seq)
+    return path
+
+
 def load_mmseqs_taxonomy(
     db_path: Path, extra_taxonomy_path: Path | None = None
 ) -> dict[str, str]:
@@ -684,6 +703,18 @@ def main() -> int:
         )
         if not paired_msa_paths:
             raise RuntimeError("Pairing requires at least two MSA-enabled protein chains")
+        paired_template_path = next(iter(paired_msa_paths.values()))
+        for chain_cfg in chains_cfg:
+            if chain_cfg["type"].lower() != "protein":
+                continue
+            tag = "_".join(normalize_ids(chain_cfg["ids"]))
+            if tag not in paired_msa_paths:
+                paired_msa_paths[tag] = write_gap_only_paired_a3m(
+                    seq=chain_cfg["sequence"],
+                    chain_dir=alignments_root / f"chain_{tag}",
+                    tag=tag,
+                    paired_template_path=paired_template_path,
+                )
         print(f"[pairing] wrote {paired_taxa} shared-taxon rows per MSA-enabled chain")
 
     chain_entries = [
