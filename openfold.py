@@ -40,7 +40,11 @@ Expected YAML structure:
       - ids: ["A"]
         type: protein
         sequence: MSEL...
-      - ids: ["B", "C"]
+      - ids: ["B"]
+        type: protein
+        sequence: MESL...
+        msa: false                              # optional: skip MSA generation
+      - ids: ["C"]
         type: ligand
         sequence: CC(=O)O                       # SMILES, or a CCD code like "ATP"
 
@@ -151,6 +155,11 @@ def normalize_ids(raw) -> list:
     return list(raw)
 
 
+def should_skip_msa(chain_cfg: dict) -> bool:
+    """Check if MSA should be skipped for this chain (msa: false)."""
+    return chain_cfg.get("msa", True) is False
+
+
 def build_chain_entry(chain_cfg: dict, alignments_root: Path) -> dict:
     """Convert one YAML chain block to an OpenFold 3 chain JSON entry."""
     ids = normalize_ids(chain_cfg["ids"])
@@ -160,12 +169,15 @@ def build_chain_entry(chain_cfg: dict, alignments_root: Path) -> dict:
 
     if ctype == "protein":
         chain_dir = alignments_root / f"chain_{'_'.join(ids)}"
-        return {
+        entry = {
             "molecule_type": "protein",
             "chain_ids": chain_ids,
             "sequence": seq,
-            "main_msa_file_paths": str(chain_dir.resolve()),
         }
+        # Only include main_msa_file_paths if MSA was generated
+        if not should_skip_msa(chain_cfg):
+            entry["main_msa_file_paths"] = str(chain_dir.resolve())
+        return entry
 
     if ctype in ("rna", "dna"):
         return {
@@ -288,16 +300,19 @@ def main() -> int:
         ids = normalize_ids(chain_cfg["ids"])
 
         if ctype == "protein":
-            chain_dir = alignments_root / f"chain_{'_'.join(ids)}"
-            tag = "_".join(ids)
-            print(f"[mmseqs] building MSA for chain(s) {ids}")
-            run_mmseqs_for_chain(
-                seq=chain_cfg["sequence"],
-                db_path=db_path,
-                chain_dir=chain_dir,
-                tmp_root=tmp_root,
-                tag=tag,
-            )
+            if should_skip_msa(chain_cfg):
+                print(f"[mmseqs] skipping MSA for chain(s) {ids} (msa: false)")
+            else:
+                chain_dir = alignments_root / f"chain_{'_'.join(ids)}"
+                tag = "_".join(ids)
+                print(f"[mmseqs] building MSA for chain(s) {ids}")
+                run_mmseqs_for_chain(
+                    seq=chain_cfg["sequence"],
+                    db_path=db_path,
+                    chain_dir=chain_dir,
+                    tmp_root=tmp_root,
+                    tag=tag,
+                )
 
         chain_entries.append(build_chain_entry(chain_cfg, alignments_root))
 
