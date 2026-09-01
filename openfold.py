@@ -5,8 +5,8 @@ server. Both this wrapper and OpenFold 3 itself are invoked through `uv`.
 
 Workflow:
   1. Parse the input YAML.
-  2. For each protein chain, run an MMseqs2 3-iteration profile search
-     against the configured custom database and emit an a3m MSA.
+  2. For each protein chain, run a configurable MMseqs2 search against the
+     custom database, unpack its result database, and validate a plain a3m MSA.
   3. Lay the alignments out in OpenFold 3's per-chain directory structure.
   4. Build the OpenFold 3 query JSON.
   5. Write a runner.yml that registers the custom MSA file with MSASettings.
@@ -36,6 +36,10 @@ Required system tools:
 Expected YAML structure:
     name: my_system
     database: /path/to/mmseqs2_custom_db        # prefix; <db>.dbtype must exist
+    mmseqs:
+      num_iterations: 1                         # macOS-safe default
+      threads: 8                                # optional
+    pairing: false                              # custom MSA is unpaired by default
     chains:
       - ids: ["A"]
         type: protein
@@ -56,13 +60,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
-
 
 # --- Tunable constants --------------------------------------------------------
 
@@ -71,11 +75,14 @@ import yaml
 CUSTOM_MSA_NAME = "custom_db_hits"
 MAX_SEQS = 100_000
 
-# MMseqs2 search settings (ColabFold-style: 3 profile iterations).
-MMSEQS_NUM_ITERATIONS = 3
+# MMseqs2 release 18 can crash in multi-iteration profile searches on macOS
+# ARM. Keep the macOS-safe default explicit and allow YAML inputs to override
+# it for environments where profile iterations are known to be stable.
+DEFAULT_MMSEQS_NUM_ITERATIONS = 1
 
 
 # --- Helpers ------------------------------------------------------------------
+
 
 def run(cmd: list, **kwargs) -> None:
     """Echo and run a subprocess; raise on non-zero exit."""
@@ -87,19 +94,94 @@ def write_query_fasta(seq: str, path: Path, name: str) -> None:
     path.write_text(f">{name}\n{seq}\n")
 
 
+def read_mmseqs_settings(spec: dict) -> tuple[int, int | None]:
+    """Read and validate optional MMseqs2 execution settings from input YAML."""
+    cfg = spec.get("mmseqs", {})
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise ValueError("mmseqs must be a mapping when provided")
+
+    num_iterations = cfg.get("num_iterations", DEFAULT_MMSEQS_NUM_ITERATIONS)
+    threads = cfg.get("threads")
+
+    if isinstance(num_iterations, bool) or not isinstance(num_iterations, int):
+        raise ValueError("mmseqs.num_iterations must be a positive integer")
+    if num_iterations < 1:
+        raise ValueError("mmseqs.num_iterations must be a positive integer")
+
+    if threads is not None and (
+        isinstance(threads, bool) or not isinstance(threads, int) or threads < 1
+    ):
+        raise ValueError("mmseqs.threads must be a positive integer")
+
+    return num_iterations, threads
+
+
+def append_threads(cmd: list[str], threads: int | None) -> list[str]:
+    """Append an MMseqs2 thread limit when one was requested."""
+    if threads is not None:
+        cmd += ["--threads", str(threads)]
+    return cmd
+
+
+def validate_a3m(path: Path, query_sequence: str) -> None:
+    """Validate that an unpacked A3M is plain text and aligned to the query."""
+    data = path.read_bytes()
+    if b"\0" in data:
+        raise RuntimeError(f"A3M contains an MMseqs2 database terminator: {path}")
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"A3M is not valid UTF-8 text: {path}") from exc
+
+    records: list[str] = []
+    current: list[str] | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if current is not None:
+                records.append("".join(current))
+            current = []
+        elif current is None:
+            raise RuntimeError(f"A3M sequence appears before its header: {path}")
+        else:
+            current.append(line)
+    if current is not None:
+        records.append("".join(current))
+
+    if not records or any(not sequence for sequence in records):
+        raise RuntimeError(f"A3M contains no complete sequence records: {path}")
+
+    def aligned_sequence(sequence: str) -> str:
+        return "".join(char for char in sequence if not char.islower() and char != ".")
+
+    aligned = [aligned_sequence(sequence) for sequence in records]
+    if aligned[0] != query_sequence:
+        raise RuntimeError(f"A3M query sequence does not match the requested sequence: {path}")
+    if any(len(sequence) != len(query_sequence) for sequence in aligned):
+        raise RuntimeError(f"A3M rows do not share the query alignment width: {path}")
+
+
 def run_mmseqs_for_chain(
     seq: str,
     db_path: Path,
     chain_dir: Path,
     tmp_root: Path,
     tag: str,
+    num_iterations: int = DEFAULT_MMSEQS_NUM_ITERATIONS,
+    threads: int | None = None,
 ) -> Path:
     """
-    Run a 3-iteration MMseqs2 profile search for `seq` against `db_path` and
-    write `<CUSTOM_MSA_NAME>.a3m` into `chain_dir`. Returns the a3m path.
+    Run an MMseqs2 search for `seq` against `db_path`, unpack its result DB,
+    and write a plain `<CUSTOM_MSA_NAME>.a3m` into `chain_dir`.
     """
     chain_dir.mkdir(parents=True, exist_ok=True)
     out_a3m = chain_dir / f"{CUSTOM_MSA_NAME}.a3m"
+    out_a3m.unlink(missing_ok=True)
 
     work = tmp_root / f"mmseqs_{tag}"
     if work.exists():
@@ -111,32 +193,71 @@ def run_mmseqs_for_chain(
 
     query_db = work / "queryDB"
     result_db = work / "resultDB"
+    msa_db = work / "msaDB"
+    unpack_dir = work / "unpacked_msa"
     search_tmp = work / "search_tmp"
     search_tmp.mkdir()
 
     run(["mmseqs", "createdb", str(query_fasta), str(query_db)])
 
-    run([
-        "mmseqs", "search",
-        str(query_db),
-        str(db_path),
-        str(result_db),
-        str(search_tmp),
-        "--num-iterations", str(MMSEQS_NUM_ITERATIONS),
-        "-a",
-    ])
+    run(
+        append_threads(
+            [
+                "mmseqs",
+                "search",
+                str(query_db),
+                str(db_path),
+                str(result_db),
+                str(search_tmp),
+                "--num-iterations",
+                str(num_iterations),
+                "-a",
+            ],
+            threads,
+        )
+    )
 
-    run([
-        "mmseqs", "result2msa",
-        str(query_db),
-        str(db_path),
-        str(result_db),
-        str(out_a3m),
-        "--msa-format-mode", "5",   # a3m, query first
-    ])
+    run(
+        append_threads(
+            [
+                "mmseqs",
+                "result2msa",
+                str(query_db),
+                str(db_path),
+                str(result_db),
+                str(msa_db),
+                "--msa-format-mode",
+                "5",  # a3m, query first
+            ],
+            threads,
+        )
+    )
 
-    if not out_a3m.exists() or out_a3m.stat().st_size == 0:
-        raise RuntimeError(f"MMseqs2 produced no MSA for {tag}: {out_a3m}")
+    unpack_dir.mkdir()
+    run(
+        append_threads(
+            [
+                "mmseqs",
+                "unpackdb",
+                str(msa_db),
+                str(unpack_dir),
+                "--unpack-name-mode",
+                "0",
+                "--unpack-suffix",
+                ".a3m",
+            ],
+            threads,
+        )
+    )
+
+    unpacked = sorted(unpack_dir.glob("*.a3m"))
+    if len(unpacked) != 1:
+        raise RuntimeError(
+            f"Expected one unpacked A3M for {tag}, found {len(unpacked)} in {unpack_dir}"
+        )
+
+    validate_a3m(unpacked[0], query_sequence=seq)
+    unpacked[0].replace(out_a3m)
 
     return out_a3m
 
@@ -197,12 +318,12 @@ def build_chain_entry(chain_cfg: dict, alignments_root: Path) -> dict:
     raise ValueError(f"Unsupported chain type: {ctype!r}")
 
 
-def write_runner_yaml(path: Path) -> None:
+def write_runner_yaml(path: Path, pairing: bool = False) -> None:
     cfg = {
         "dataset_config_kwargs": {
             "msa": {
                 "max_seq_counts": {CUSTOM_MSA_NAME: MAX_SEQS},
-                "msas_to_pair": [],          # no online pairing for a custom DB
+                "msas_to_pair": [CUSTOM_MSA_NAME] if pairing else [],
                 "aln_order": [CUSTOM_MSA_NAME],
             }
         },
@@ -227,6 +348,39 @@ def write_runner_yaml(path: Path) -> None:
     path.write_text(yaml.safe_dump(cfg, sort_keys=False))
 
 
+def validate_prediction_outputs(predictions_dir: Path, expected_query_names: list[str]) -> None:
+    """Reject semantically failed OpenFold runs even when their exit code is zero."""
+    summary_path = predictions_dir / "summary.txt"
+    if not summary_path.is_file():
+        raise RuntimeError(f"OpenFold produced no prediction summary: {summary_path}")
+
+    summary = summary_path.read_text()
+
+    def read_count(label: str) -> int:
+        match = re.search(rf"{re.escape(label)}:\s*(\d+)", summary)
+        if match is None:
+            raise RuntimeError(f"OpenFold summary is missing {label!r}: {summary_path}")
+        return int(match.group(1))
+
+    total = read_count("Total Queries Processed")
+    successful = read_count("Successful Queries")
+    failed = read_count("Failed Queries")
+    expected = len(expected_query_names)
+    if total != expected or successful != expected or failed != 0:
+        raise RuntimeError("OpenFold reported unsuccessful predictions:\n" + summary.strip())
+
+    missing_models = [
+        query_name
+        for query_name in expected_query_names
+        if not any((predictions_dir / query_name).rglob("*_model.cif"))
+    ]
+    if missing_models:
+        raise RuntimeError(
+            "OpenFold reported success but produced no mmCIF model for: "
+            + ", ".join(missing_models)
+        )
+
+
 def build_uv_run_prefix(
     openfold_project: Path | None,
     openfold_with: list,
@@ -242,6 +396,7 @@ def build_uv_run_prefix(
 
 # --- Main ---------------------------------------------------------------------
 
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -254,14 +409,14 @@ def main() -> int:
         default=None,
         type=Path,
         help="Override the OpenFold 3 checkpoint path. "
-             "If omitted, the default cached weights are used.",
+        "If omitted, the default cached weights are used.",
     )
     ap.add_argument(
         "--openfold_project",
         default=None,
         type=Path,
         help="Path to a uv project (directory containing pyproject.toml) "
-             "where openfold3 is installed. Forwarded as `uv run --project`.",
+        "where openfold3 is installed. Forwarded as `uv run --project`.",
     )
     ap.add_argument(
         "--openfold_with",
@@ -269,7 +424,7 @@ def main() -> int:
         action="append",
         metavar="SPEC",
         help="Package spec(s) to install ephemerally for the openfold run. "
-             "May be passed multiple times. Forwarded as `uv run --with`.",
+        "May be passed multiple times. Forwarded as `uv run --with`.",
     )
     args = ap.parse_args()
 
@@ -278,6 +433,10 @@ def main() -> int:
     name = spec["name"]
     db_path = Path(spec["database"]).expanduser().resolve()
     chains_cfg = spec["chains"]
+    num_iterations, mmseqs_threads = read_mmseqs_settings(spec)
+    pairing = spec.get("pairing", False)
+    if not isinstance(pairing, bool):
+        raise ValueError("pairing must be true or false")
 
     out = args.output_dir.expanduser().resolve()
     alignments_root = out / "alignments"
@@ -312,19 +471,29 @@ def main() -> int:
                     chain_dir=chain_dir,
                     tmp_root=tmp_root,
                     tag=tag,
+                    num_iterations=num_iterations,
+                    threads=mmseqs_threads,
                 )
 
         chain_entries.append(build_chain_entry(chain_cfg, alignments_root))
 
     # ---- 2) Write the query JSON
-    query_json = {"queries": {name: {"chains": chain_entries}}}
+    query_json = {
+        "queries": {
+            name: {
+                "chains": chain_entries,
+                "use_paired_msas": pairing,
+                "use_main_msas": True,
+            }
+        }
+    }
     query_json_path = out / f"{name}_query.json"
     query_json_path.write_text(json.dumps(query_json, indent=2))
     print(f"[query] wrote {query_json_path}")
 
     # ---- 3) Write the runner YAML
     runner_yaml_path = out / "runner.yml"
-    write_runner_yaml(runner_yaml_path)
+    write_runner_yaml(runner_yaml_path, pairing=pairing)
     print(f"[runner] wrote {runner_yaml_path}")
 
     # ---- 4) Invoke OpenFold 3 through uv
@@ -332,8 +501,10 @@ def main() -> int:
         openfold_project=args.openfold_project,
         openfold_with=args.openfold_with,
     )
-    cmd = uv_prefix + [
-        "run_openfold", "predict",
+    cmd = [
+        *uv_prefix,
+        "run_openfold",
+        "predict",
         f"--query_json={query_json_path}",
         "--use_msa_server=False",
         f"--output_dir={predictions_dir}",
@@ -343,6 +514,7 @@ def main() -> int:
         cmd.append(f"--inference_ckpt_path={args.inference_ckpt_path}")
 
     run(cmd)
+    validate_prediction_outputs(predictions_dir, expected_query_names=[name])
     print(f"[done] predictions written under {predictions_dir}")
     return 0
 

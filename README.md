@@ -12,7 +12,7 @@ Local MMseqs2 + MLX-powered OpenFold 3 wrapper for Apple Silicon. Run protein st
 The wrapper takes a declarative YAML input, runs the MSA search locally, and hands the results to OpenFold 3 for prediction — all through `uv`.
 
 ```
-Input YAML  →  MMseqs2 search  →  MSA (.a3m)  →  OpenFold 3 (MLX)  →  predictions/
+Input YAML  →  MMseqs2 search  →  unpacked MSA (.a3m)  →  OpenFold 3 (MLX)  →  predictions/
 ```
 
 ## Requirements
@@ -100,6 +100,10 @@ The database path used in your YAML is the **prefix** — e.g. `/path/to/my_db`.
 ```yaml
 name: my_complex                      # output name (used for filenames)
 database: /path/to/mmseqs_db          # MMseqs2 DB prefix
+mmseqs:
+  num_iterations: 1                   # default: 1 (safe on macOS ARM)
+  threads: 8                          # optional; MMseqs2 default if omitted
+pairing: false                        # default: false for arbitrary custom DBs
 chains:
   - ids: ["A"]                        # chain ID(s)
     type: protein                     # protein | rna | dna | ligand
@@ -110,6 +114,14 @@ chains:
 ```
 
 - **`database`**: path prefix to the MMseqs2 database.
+- **`mmseqs.num_iterations`**: number of profile-search iterations. The default
+  is `1` because MMseqs2 releases 17 and 18 can crash in multi-iteration profile
+  searches on macOS ARM. Use `3` only after verifying it is stable with your DB.
+- **`mmseqs.threads`**: optional thread limit forwarded to MMseqs2 search and MSA
+  export commands.
+- **`pairing`**: whether OpenFold should pair MSA rows online. It defaults to
+  `false`; arbitrary custom-database headers usually do not contain the UniProt
+  species metadata required by OpenFold pairing.
 - **`chains`**: one block per chain. Multiple IDs on one entry mean identical sequences (useful for homomers).
 - **`type: protein`**: triggers the MMseqs2 MSA search (required for at least one chain). Non-protein chains are passed directly to OpenFold 3.
 - **`type: ligand`**: short uppercase strings are treated as CCD codes, longer strings as SMILES.
@@ -142,11 +154,11 @@ openfold ... --openfold_with git+https://github.com/latent-spacecraft/openfold-3
 results/
 ├── alignments/                  # per-chain a3m files from MMseqs2
 │   └── chain_A/
-│       └── custom_db_hits.a3m
+│       └── custom_db_hits.a3m        # unpacked and validated plain-text A3M
 ├── tmp/                         # MMseqs2 temporary files
 ├── my_complex_query.json        # OpenFold 3 query JSON
 ├── runner.yml                   # runner config (MLX settings)
-└── predictions/                 # OpenFold 3 output (PDB, PAE, etc.)
+└── predictions/                 # OpenFold 3 output (mmCIF, confidence, PAE)
 ```
 
 ## Full example
@@ -160,6 +172,9 @@ mmseqs createindex uniref30 tmp_idx
 cat > my_protein.yaml << 'EOF'
 name: af2_sample
 database: /Users/me/dbs/uniref30
+mmseqs:
+  num_iterations: 1
+pairing: false
 chains:
   - ids: ["A"]
     type: protein
@@ -173,6 +188,26 @@ openfold --input_yaml my_protein.yaml --output_dir results/
 ls results/predictions/
 ```
 
+The command exits with an error if OpenFold writes a failed `summary.txt`,
+reports fewer successful queries than requested, or produces no mmCIF model.
+
+## MSA export and pairing
+
+`mmseqs result2msa` writes an MMseqs2 result database, not a standalone file,
+even when its output prefix ends in `.a3m`. The wrapper keeps that database in
+`tmp/`, runs `mmseqs unpackdb`, validates the resulting plain-text A3M, and only
+then exposes it to OpenFold.
+
+For heteromers, `pairing: false` still uses every custom MSA as a main unpaired
+alignment. Set `pairing: true` only when all non-query headers use the species
+metadata format expected by OpenFold 3.
+
+## Tests
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -180,7 +215,9 @@ ls results/predictions/
 | `mmseqs: command not found` | Run `brew install brewsci/bio/mmseqs2` and restart your shell. |
 | `MMseqs2 DB not found` | Verify the path in your YAML `database:` field — the `.dbtype` file must exist at that prefix. |
 | `RuntimeError: MMseqs2 produced no MSA` | Your query sequence has no homologs in the database. Try a larger/unfiltered DB like UniRef30. |
+| `Bus error: 10` or `Prefilter died` with multiple iterations on Apple Silicon | Set `mmseqs.num_iterations: 1`. Multi-iteration MMseqs2 profile search has known macOS ARM crashes. |
 | `run_openfold: command not found` | Install it with `uv tool install https://github.com/latent-spacecraft/openfold-3-mlx.git`. |
+| OpenFold exits normally but `summary.txt` reports failed queries | The wrapper now treats this as an error. Read the OpenFold traceback above the summary; no successful structure was produced. |
 | Out of memory (OOM) | Close other applications, reduce `MAX_SEQS` in `openfold.py`, or use a smaller protein. |
 | MLX attention errors | Ensure you are on macOS ≥14 and Apple Silicon. Intel Macs are not supported. |
 
