@@ -115,6 +115,88 @@ class OpenFoldWrapperTests(unittest.TestCase):
         self.assertEqual(captured_mmseqs[0]["num_iterations"], 1)
         self.assertEqual(captured_mmseqs[0]["threads"], 3)
 
+    def test_main_builds_precomputed_taxonomy_pairing_and_query_only_peptide(self) -> None:
+        def fake_mmseqs(**kwargs) -> Path:
+            tag = kwargs["tag"]
+            chain_dir = kwargs["chain_dir"]
+            chain_dir.mkdir(parents=True, exist_ok=True)
+            msa_path = chain_dir / "custom_db_hits.a3m"
+            if tag == "A":
+                msa_path.write_text(">A\nACD\n>P_A\nACD\n>P_A2\nA-D\n")
+            else:
+                msa_path.write_text(">B\nEFG\n>P_B\nEFG\n>P_B2\nE-G\n")
+            return msa_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_yaml = root / "input.yml"
+            output_dir = root / "output"
+            db_path = root / "target_db"
+            Path(f"{db_path}.dbtype").write_bytes(b"\x00")
+            Path(f"{db_path}_h").write_bytes(
+                b"sp|P_A|A_SPEC Protein A OX=9606\n\0"
+                b"sp|P_A2|A_MOUSE Protein A OX=10090\n\0"
+                b"sp|P_B|B_SPEC Protein B OX=9606\n\0"
+                b"sp|P_B2|B_MOUSE Protein B OX=10090\n\0"
+            )
+            input_yaml.write_text(
+                yaml.safe_dump(
+                    {
+                        "name": "test_complex",
+                        "database": str(db_path),
+                        "pairing": True,
+                        "chains": [
+                            {"ids": ["A"], "type": "protein", "sequence": "ACD"},
+                            {"ids": ["B"], "type": "protein", "sequence": "EFG"},
+                            {
+                                "ids": ["C"],
+                                "type": "protein",
+                                "sequence": "HIK",
+                                "msa": False,
+                            },
+                        ],
+                    }
+                )
+            )
+
+            with (
+                mock.patch.object(openfold, "run_mmseqs_for_chain", side_effect=fake_mmseqs),
+                mock.patch.object(openfold, "run", side_effect=self._write_successful_prediction),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "openfold",
+                        "--input_yaml",
+                        str(input_yaml),
+                        "--output_dir",
+                        str(output_dir),
+                    ],
+                ),
+            ):
+                self.assertEqual(openfold.main(), 0)
+
+            query = json.loads((output_dir / "test_complex_query.json").read_text())
+            query_cfg = query["queries"]["test_complex"]
+            self.assertIs(query_cfg["use_paired_msas"], True)
+            chains = {chain["chain_ids"]: chain for chain in query_cfg["chains"]}
+            self.assertIn("paired_msa_file_paths", chains["A"])
+            self.assertIn("paired_msa_file_paths", chains["B"])
+            self.assertNotIn("paired_msa_file_paths", chains["C"])
+            self.assertTrue(chains["C"]["main_msa_file_paths"].endswith("query_only.a3m"))
+
+            paired_a = Path(chains["A"]["paired_msa_file_paths"]).read_text()
+            paired_b = Path(chains["B"]["paired_msa_file_paths"]).read_text()
+            self.assertEqual(paired_a.count(">"), 3)
+            self.assertEqual(paired_b.count(">"), 3)
+            self.assertIn("OX9606", paired_a)
+            self.assertIn("OX10090", paired_b)
+
+            runner = yaml.safe_load((output_dir / "runner.yml").read_text())
+            msa = runner["dataset_config_kwargs"]["msa"]
+            self.assertEqual(msa["msas_to_pair"], [])
+            self.assertEqual(msa["paired_msa_order"], ["custom_db_paired"])
+
     def test_main_rejects_zero_exit_prediction_with_failed_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

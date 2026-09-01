@@ -103,7 +103,8 @@ database: /path/to/mmseqs_db          # MMseqs2 DB prefix
 mmseqs:
   num_iterations: 1                   # default: 1 (safe on macOS ARM)
   threads: 8                          # optional; MMseqs2 default if omitted
-pairing: false                        # default: false for arbitrary custom DBs
+pairing: false                        # true: pre-pair best Swiss-Prot hits by OX taxon
+pairing_taxonomy: /path/to/extra.tsv  # optional accession<TAB>taxon_id sidecar
 chains:
   - ids: ["A"]                        # chain ID(s)
     type: protein                     # protein | rna | dna | ligand
@@ -111,6 +112,10 @@ chains:
   - ids: ["B", "C"]
     type: ligand
     sequence: ATP                     # CCD code (uppercase, ≤5 chars) or SMILES
+  - ids: ["D"]
+    type: protein
+    sequence: PEPTIDESEQUENCE
+    msa: false                        # query-only MSA, useful for a bound peptide
 ```
 
 - **`database`**: path prefix to the MMseqs2 database.
@@ -119,11 +124,19 @@ chains:
   searches on macOS ARM. Use `3` only after verifying it is stable with your DB.
 - **`mmseqs.threads`**: optional thread limit forwarded to MMseqs2 search and MSA
   export commands.
-- **`pairing`**: whether OpenFold should pair MSA rows online. It defaults to
-  `false`; arbitrary custom-database headers usually do not contain the UniProt
-  species metadata required by OpenFold pairing.
+- **`pairing`**: when `true`, the wrapper reads Swiss-Prot `OX=` taxonomy IDs
+  from the MMseqs header database, selects the closest hit per taxon and chain,
+  and writes row-aligned precomputed paired MSAs for OpenFold. Non-Swiss-Prot
+  records without an `OX=` identifier remain available in the main unpaired MSA
+  but are not guessed into pairs.
+- **`pairing_taxonomy`**: optional TSV sidecar for curated database records whose
+  FASTA headers lack `OX=`. Its first two columns must be the exact A3M accession
+  and numeric NCBI taxonomy ID. Blank lines, `#` comments and a header beginning
+  with `accession` are accepted.
 - **`chains`**: one block per chain. Multiple IDs on one entry mean identical sequences (useful for homomers).
 - **`type: protein`**: triggers the MMseqs2 MSA search (required for at least one chain). Non-protein chains are passed directly to OpenFold 3.
+- **`msa: false`**: skips MMseqs for that protein but still writes the query-only
+  A3M required by OpenFold. This is appropriate for a short bound peptide.
 - **`type: ligand`**: short uppercase strings are treated as CCD codes, longer strings as SMILES.
 
 ## Usage
@@ -199,8 +212,11 @@ even when its output prefix ends in `.a3m`. The wrapper keeps that database in
 then exposes it to OpenFold.
 
 For heteromers, `pairing: false` still uses every custom MSA as a main unpaired
-alignment. Set `pairing: true` only when all non-query headers use the species
-metadata format expected by OpenFold 3.
+alignment. With `pairing: true`, the wrapper keeps that main MSA and additionally
+creates one precomputed paired A3M per MSA-enabled protein chain. Pairing is
+restricted to taxa present in every such chain and uses the best query match in
+each taxon. The MMseqs database must therefore retain its `<prefix>_h` header DB
+with Swiss-Prot-style headers containing `OX=` taxonomy identifiers.
 
 ## Tests
 

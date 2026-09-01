@@ -73,6 +73,8 @@ import yaml
 # Filename used for MSAs produced by the custom database. Must match the key
 # in runner.yml -> dataset_config_kwargs.msa.aln_order / max_seq_counts.
 CUSTOM_MSA_NAME = "custom_db_hits"
+PAIRED_MSA_NAME = "custom_db_paired"
+QUERY_ONLY_MSA_NAME = "query_only"
 MAX_SEQS = 100_000
 
 # MMseqs2 release 18 can crash in multi-iteration profile searches on macOS
@@ -164,6 +166,175 @@ def validate_a3m(path: Path, query_sequence: str) -> None:
         raise RuntimeError(f"A3M query sequence does not match the requested sequence: {path}")
     if any(len(sequence) != len(query_sequence) for sequence in aligned):
         raise RuntimeError(f"A3M rows do not share the query alignment width: {path}")
+
+
+def read_a3m_records(path: Path) -> list[tuple[str, str]]:
+    """Read A3M records while preserving lowercase insertion characters."""
+    records: list[tuple[str, str]] = []
+    header: str | None = None
+    sequence: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if header is not None:
+                records.append((header, "".join(sequence)))
+            header = line[1:]
+            sequence = []
+        elif header is None:
+            raise RuntimeError(f"A3M sequence appears before its header: {path}")
+        else:
+            sequence.append(line)
+    if header is not None:
+        records.append((header, "".join(sequence)))
+    if not records:
+        raise RuntimeError(f"A3M contains no records: {path}")
+    return records
+
+
+def write_a3m_records(path: Path, records: list[tuple[str, str]]) -> None:
+    """Write records as a deterministic, plain-text A3M file."""
+    text = "".join(f">{header}\n{sequence}\n" for header, sequence in records)
+    path.write_text(text, encoding="utf-8")
+
+
+def write_query_only_a3m(seq: str, chain_dir: Path, tag: str) -> Path:
+    """Represent an MSA-disabled protein chain with its mandatory query row."""
+    chain_dir.mkdir(parents=True, exist_ok=True)
+    path = chain_dir / f"{QUERY_ONLY_MSA_NAME}.a3m"
+    write_a3m_records(path, [(tag, seq)])
+    validate_a3m(path, query_sequence=seq)
+    return path
+
+
+def load_mmseqs_taxonomy(
+    db_path: Path, extra_taxonomy_path: Path | None = None
+) -> dict[str, str]:
+    """Map Swiss-Prot accessions to NCBI taxonomy IDs from an MMseqs header DB."""
+    header_db = Path(f"{db_path}_h")
+    if not header_db.is_file():
+        raise RuntimeError(
+            f"Pairing requires the MMseqs2 header database: expected {header_db}"
+        )
+
+    taxonomy: dict[str, str] = {}
+    remainder = b""
+    with header_db.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            entries = (remainder + chunk).split(b"\0")
+            remainder = entries.pop()
+            for entry in entries:
+                match = re.match(rb"(?:sp|tr)\|([^|]+)\|.*?\bOX=(\d+)\b", entry)
+                if match is not None:
+                    taxonomy[match.group(1).decode()] = match.group(2).decode()
+                    continue
+                hla_match = re.match(rb"(HLA:[^ ]+)", entry)
+                if hla_match is not None:
+                    taxonomy[hla_match.group(1).decode()] = "9606"
+    if remainder:
+        match = re.match(rb"(?:sp|tr)\|([^|]+)\|.*?\bOX=(\d+)\b", remainder)
+        if match is not None:
+            taxonomy[match.group(1).decode()] = match.group(2).decode()
+    if extra_taxonomy_path is not None:
+        with extra_taxonomy_path.open(encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line or line.startswith("#") or line.startswith("accession\t"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2 or not fields[1].isdigit():
+                    raise RuntimeError(
+                        f"Invalid taxonomy map row {extra_taxonomy_path}:{line_number}"
+                    )
+                taxonomy[fields[0]] = fields[1]
+    if not taxonomy:
+        raise RuntimeError(f"No Swiss-Prot OX taxonomy identifiers found in {header_db}")
+    return taxonomy
+
+
+def normalize_accession(header: str) -> str:
+    """Extract the accession token emitted by MMseqs result2msa."""
+    token = header.split(maxsplit=1)[0].split("/", maxsplit=1)[0]
+    parts = token.split("|")
+    if len(parts) >= 3 and parts[0] in {"sp", "tr"}:
+        return parts[1]
+    return token
+
+
+def aligned_a3m_sequence(sequence: str) -> str:
+    """Remove A3M insertions while retaining the query-width alignment."""
+    return "".join(char for char in sequence if not char.islower() and char != ".")
+
+
+def best_hits_by_taxon(
+    records: list[tuple[str, str]], taxonomy: dict[str, str]
+) -> dict[str, tuple[tuple[int, int, int], tuple[str, str]]]:
+    """Choose the closest query hit for each taxon using identity then coverage."""
+    query = aligned_a3m_sequence(records[0][1])
+    best: dict[str, tuple[tuple[int, int, int], tuple[str, str]]] = {}
+    for rank, record in enumerate(records[1:]):
+        accession = normalize_accession(record[0])
+        taxon = taxonomy.get(accession)
+        if taxon is None:
+            continue
+        aligned = aligned_a3m_sequence(record[1])
+        matches = sum(
+            query_residue == hit_residue
+            for query_residue, hit_residue in zip(query, aligned, strict=True)
+            if hit_residue != "-"
+        )
+        coverage = sum(residue != "-" for residue in aligned)
+        score = (matches, coverage, -rank)
+        if taxon not in best or score > best[taxon][0]:
+            best[taxon] = (score, record)
+    return best
+
+
+def build_precomputed_paired_msas(
+    msa_paths: dict[str, Path], db_path: Path, extra_taxonomy_path: Path | None = None
+) -> tuple[dict[str, Path], int]:
+    """Pair the closest per-chain homologs that share an exact taxonomy ID."""
+    if len(msa_paths) < 2:
+        return {}, 0
+
+    taxonomy = load_mmseqs_taxonomy(db_path, extra_taxonomy_path)
+    records_by_chain = {tag: read_a3m_records(path) for tag, path in msa_paths.items()}
+    hits_by_chain = {
+        tag: best_hits_by_taxon(records, taxonomy)
+        for tag, records in records_by_chain.items()
+    }
+    shared_taxa = set.intersection(*(set(hits) for hits in hits_by_chain.values()))
+    if not shared_taxa:
+        raise RuntimeError(
+            "Pairing requested, but the MSA-enabled chains share no Swiss-Prot OX taxa"
+        )
+
+    def taxon_score(taxon: str) -> tuple[int, int, int]:
+        scores = [hits[taxon][0] for hits in hits_by_chain.values()]
+        return (
+            sum(score[0] for score in scores),
+            sum(score[1] for score in scores),
+            -int(taxon),
+        )
+
+    ordered_taxa = sorted(shared_taxa, key=taxon_score, reverse=True)
+    paired_paths: dict[str, Path] = {}
+    for tag, main_path in msa_paths.items():
+        query_record = records_by_chain[tag][0]
+        paired_records = [query_record]
+        paired_records.extend(
+            (f"pair_{index:05d}_OX{taxon}", hits_by_chain[tag][taxon][1][1])
+            for index, taxon in enumerate(ordered_taxa, start=1)
+        )
+        paired_path = main_path.parent / f"{PAIRED_MSA_NAME}.a3m"
+        write_a3m_records(paired_path, paired_records)
+        validate_a3m(
+            paired_path,
+            query_sequence=aligned_a3m_sequence(query_record[1]),
+        )
+        paired_paths[tag] = paired_path
+    return paired_paths, len(ordered_taxa)
 
 
 def run_mmseqs_for_chain(
@@ -281,23 +452,27 @@ def should_skip_msa(chain_cfg: dict) -> bool:
     return chain_cfg.get("msa", True) is False
 
 
-def build_chain_entry(chain_cfg: dict, alignments_root: Path) -> dict:
+def build_chain_entry(
+    chain_cfg: dict,
+    main_msa_paths: dict[str, Path],
+    paired_msa_paths: dict[str, Path],
+) -> dict:
     """Convert one YAML chain block to an OpenFold 3 chain JSON entry."""
     ids = normalize_ids(chain_cfg["ids"])
+    tag = "_".join(ids)
     chain_ids = ",".join(ids)
     ctype = chain_cfg["type"].lower()
     seq = chain_cfg["sequence"]
 
     if ctype == "protein":
-        chain_dir = alignments_root / f"chain_{'_'.join(ids)}"
         entry = {
             "molecule_type": "protein",
             "chain_ids": chain_ids,
             "sequence": seq,
+            "main_msa_file_paths": str(main_msa_paths[tag].resolve()),
         }
-        # Only include main_msa_file_paths if MSA was generated
-        if not should_skip_msa(chain_cfg):
-            entry["main_msa_file_paths"] = str(chain_dir.resolve())
+        if tag in paired_msa_paths:
+            entry["paired_msa_file_paths"] = str(paired_msa_paths[tag].resolve())
         return entry
 
     if ctype in ("rna", "dna"):
@@ -322,9 +497,16 @@ def write_runner_yaml(path: Path, pairing: bool = False) -> None:
     cfg = {
         "dataset_config_kwargs": {
             "msa": {
-                "max_seq_counts": {CUSTOM_MSA_NAME: MAX_SEQS},
-                "msas_to_pair": [CUSTOM_MSA_NAME] if pairing else [],
-                "aln_order": [CUSTOM_MSA_NAME],
+                "max_seq_counts": {
+                    CUSTOM_MSA_NAME: MAX_SEQS,
+                    PAIRED_MSA_NAME: MAX_SEQS,
+                    QUERY_ONLY_MSA_NAME: 1,
+                },
+                # Pairing is precomputed by this wrapper. Do not ask OpenFold to
+                # reinterpret the main custom MSA headers as online-pairing metadata.
+                "msas_to_pair": [],
+                "aln_order": [CUSTOM_MSA_NAME, QUERY_ONLY_MSA_NAME],
+                "paired_msa_order": [PAIRED_MSA_NAME] if pairing else [],
             }
         },
         # MLX attention for Apple Silicon (openfold-3-mlx fork).
@@ -437,6 +619,16 @@ def main() -> int:
     pairing = spec.get("pairing", False)
     if not isinstance(pairing, bool):
         raise ValueError("pairing must be true or false")
+    pairing_taxonomy_raw = spec.get("pairing_taxonomy")
+    pairing_taxonomy_path = (
+        Path(pairing_taxonomy_raw).expanduser().resolve()
+        if pairing_taxonomy_raw is not None
+        else None
+    )
+    if pairing_taxonomy_path is not None and not pairing_taxonomy_path.is_file():
+        raise FileNotFoundError(
+            f"Pairing taxonomy map is missing: {pairing_taxonomy_path}"
+        )
 
     out = args.output_dir.expanduser().resolve()
     alignments_root = out / "alignments"
@@ -452,20 +644,26 @@ def main() -> int:
             f"Did you point `database:` at a valid MMseqs2 DB prefix?"
         )
 
-    # ---- 1) Run MMseqs2 for each protein chain, build chain entries
-    chain_entries = []
+    # ---- 1) Run MMseqs2 and prepare mandatory per-protein query/main MSAs
+    main_msa_paths: dict[str, Path] = {}
+    pairable_msa_paths: dict[str, Path] = {}
     for chain_cfg in chains_cfg:
         ctype = chain_cfg["type"].lower()
         ids = normalize_ids(chain_cfg["ids"])
+        tag = "_".join(ids)
 
         if ctype == "protein":
+            chain_dir = alignments_root / f"chain_{tag}"
             if should_skip_msa(chain_cfg):
                 print(f"[mmseqs] skipping MSA for chain(s) {ids} (msa: false)")
+                main_msa_paths[tag] = write_query_only_a3m(
+                    seq=chain_cfg["sequence"],
+                    chain_dir=chain_dir,
+                    tag=tag,
+                )
             else:
-                chain_dir = alignments_root / f"chain_{'_'.join(ids)}"
-                tag = "_".join(ids)
                 print(f"[mmseqs] building MSA for chain(s) {ids}")
-                run_mmseqs_for_chain(
+                main_msa_paths[tag] = run_mmseqs_for_chain(
                     seq=chain_cfg["sequence"],
                     db_path=db_path,
                     chain_dir=chain_dir,
@@ -474,15 +672,31 @@ def main() -> int:
                     num_iterations=num_iterations,
                     threads=mmseqs_threads,
                 )
+                pairable_msa_paths[tag] = main_msa_paths[tag]
 
-        chain_entries.append(build_chain_entry(chain_cfg, alignments_root))
+    paired_msa_paths: dict[str, Path] = {}
+    paired_taxa = 0
+    if pairing:
+        paired_msa_paths, paired_taxa = build_precomputed_paired_msas(
+            pairable_msa_paths,
+            db_path,
+            pairing_taxonomy_path,
+        )
+        if not paired_msa_paths:
+            raise RuntimeError("Pairing requires at least two MSA-enabled protein chains")
+        print(f"[pairing] wrote {paired_taxa} shared-taxon rows per MSA-enabled chain")
+
+    chain_entries = [
+        build_chain_entry(chain_cfg, main_msa_paths, paired_msa_paths)
+        for chain_cfg in chains_cfg
+    ]
 
     # ---- 2) Write the query JSON
     query_json = {
         "queries": {
             name: {
                 "chains": chain_entries,
-                "use_paired_msas": pairing,
+                "use_paired_msas": bool(paired_msa_paths),
                 "use_main_msas": True,
             }
         }
