@@ -257,6 +257,107 @@ class OpenFoldWrapperTests(unittest.TestCase):
             ):
                 openfold.main()
 
+    def test_prepare_stage_writes_inputs_without_running_prediction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_yaml = root / "input.yml"
+            output_dir = root / "output"
+            db_path = root / "target_db"
+            Path(f"{db_path}.dbtype").write_bytes(b"\x00")
+            input_yaml.write_text(
+                yaml.safe_dump(
+                    {
+                        "name": "test_complex",
+                        "database": str(db_path),
+                        "chains": [
+                            {
+                                "ids": ["A"],
+                                "type": "protein",
+                                "sequence": "ACD",
+                                "msa": False,
+                            }
+                        ],
+                    }
+                )
+            )
+
+            with (
+                mock.patch.object(openfold, "run") as run_mock,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "openfold",
+                        "--input_yaml",
+                        str(input_yaml),
+                        "--output_dir",
+                        str(output_dir),
+                        "--stage",
+                        "prepare",
+                    ],
+                ),
+            ):
+                self.assertEqual(openfold.main(), 0)
+
+            run_mock.assert_not_called()
+            self.assertTrue((output_dir / "test_complex_query.json").is_file())
+            self.assertTrue((output_dir / "runner.yml").is_file())
+            self.assertFalse((output_dir / "predictions" / "summary.txt").exists())
+
+    def test_predict_stage_uses_prepared_inputs_without_mmseqs_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_yaml = root / "input.yml"
+            output_dir = root / "output"
+            input_yaml.write_text(
+                yaml.safe_dump(
+                    {
+                        "name": "test_complex",
+                        "database": str(root / "missing_db"),
+                        "chains": [
+                            {
+                                "ids": ["A"],
+                                "type": "protein",
+                                "sequence": "ACD",
+                            }
+                        ],
+                    }
+                )
+            )
+            output_dir.mkdir()
+            (output_dir / "test_complex_query.json").write_text(
+                json.dumps({"queries": {"test_complex": {"chains": []}}})
+            )
+            (output_dir / "runner.yml").write_text("dataset_config_kwargs: {}\n")
+
+            with (
+                mock.patch.object(
+                    openfold,
+                    "run",
+                    side_effect=self._write_successful_prediction,
+                ) as run_mock,
+                mock.patch.object(openfold, "run_mmseqs_for_chain") as mmseqs_mock,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "openfold",
+                        "--input_yaml",
+                        str(input_yaml),
+                        "--output_dir",
+                        str(output_dir),
+                        "--stage",
+                        "predict",
+                    ],
+                ),
+            ):
+                self.assertEqual(openfold.main(), 0)
+
+            mmseqs_mock.assert_not_called()
+            command = run_mock.call_args.args[0]
+            self.assertIn("run_openfold", command)
+            self.assertIn("--use_msa_server=False", command)
+
     @staticmethod
     def _write_successful_prediction(cmd: list[str], **_kwargs) -> None:
         output_arg = next(arg for arg in cmd if arg.startswith("--output_dir="))

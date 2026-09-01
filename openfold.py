@@ -14,6 +14,8 @@ Workflow:
 
 Usage (after `uv tool install /path/to/this/dir`):
     openfold --input_yaml in.yaml --output_dir out/
+    openfold --input_yaml in.yaml --output_dir out/ --stage prepare
+    openfold --input_yaml in.yaml --output_dir out/ --stage predict
     uvx openfold --input_yaml in.yaml --output_dir out/      # ephemeral
 
 Pointing at the OpenFold 3 environment:
@@ -595,6 +597,51 @@ def build_uv_run_prefix(
     return cmd
 
 
+def run_openfold_prediction(
+    *,
+    query_json_path: Path,
+    runner_yaml_path: Path,
+    predictions_dir: Path,
+    query_name: str,
+    inference_ckpt_path: Path | None,
+    openfold_project: Path | None,
+    openfold_with: list[str],
+) -> None:
+    """Run OpenFold against artifacts created by the preparation stage."""
+    for artifact in (query_json_path, runner_yaml_path):
+        if not artifact.is_file():
+            raise FileNotFoundError(
+                f"Prepared OpenFold artifact is missing: {artifact}. "
+                "Run the wrapper with --stage prepare first."
+            )
+
+    query_json = json.loads(query_json_path.read_text())
+    if query_name not in query_json.get("queries", {}):
+        raise ValueError(
+            f"Prepared query JSON does not contain query {query_name!r}: {query_json_path}"
+        )
+
+    uv_prefix = build_uv_run_prefix(
+        openfold_project=openfold_project,
+        openfold_with=openfold_with,
+    )
+    cmd = [
+        *uv_prefix,
+        "run_openfold",
+        "predict",
+        f"--query_json={query_json_path}",
+        "--use_msa_server=False",
+        f"--output_dir={predictions_dir}",
+        f"--runner_yaml={runner_yaml_path}",
+    ]
+    if inference_ckpt_path is not None:
+        cmd.append(f"--inference_ckpt_path={inference_ckpt_path}")
+
+    run(cmd)
+    validate_prediction_outputs(predictions_dir, expected_query_names=[query_name])
+    print(f"[done] predictions written under {predictions_dir}")
+
+
 # --- Main ---------------------------------------------------------------------
 
 
@@ -605,6 +652,13 @@ def main() -> int:
     )
     ap.add_argument("--input_yaml", required=True, type=Path)
     ap.add_argument("--output_dir", required=True, type=Path)
+    ap.add_argument(
+        "--stage",
+        choices=("all", "prepare", "predict"),
+        default="all",
+        help="Run both stages (default), prepare local MSAs/query files only, "
+        "or predict from previously prepared files.",
+    )
     ap.add_argument(
         "--inference_ckpt_path",
         default=None,
@@ -632,6 +686,27 @@ def main() -> int:
     # ---- Load input
     spec = yaml.safe_load(args.input_yaml.read_text())
     name = spec["name"]
+    out = args.output_dir.expanduser().resolve()
+    alignments_root = out / "alignments"
+    tmp_root = out / "tmp"
+    predictions_dir = out / "predictions"
+    for d in (out, alignments_root, tmp_root, predictions_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    query_json_path = out / f"{name}_query.json"
+    runner_yaml_path = out / "runner.yml"
+    if args.stage == "predict":
+        run_openfold_prediction(
+            query_json_path=query_json_path,
+            runner_yaml_path=runner_yaml_path,
+            predictions_dir=predictions_dir,
+            query_name=name,
+            inference_ckpt_path=args.inference_ckpt_path,
+            openfold_project=args.openfold_project,
+            openfold_with=args.openfold_with,
+        )
+        return 0
+
     db_path = Path(spec["database"]).expanduser().resolve()
     chains_cfg = spec["chains"]
     num_iterations, mmseqs_threads = read_mmseqs_settings(spec)
@@ -648,13 +723,6 @@ def main() -> int:
         raise FileNotFoundError(
             f"Pairing taxonomy map is missing: {pairing_taxonomy_path}"
         )
-
-    out = args.output_dir.expanduser().resolve()
-    alignments_root = out / "alignments"
-    tmp_root = out / "tmp"
-    predictions_dir = out / "predictions"
-    for d in (out, alignments_root, tmp_root, predictions_dir):
-        d.mkdir(parents=True, exist_ok=True)
 
     # ---- Sanity-check the MMseqs2 DB
     if not Path(f"{db_path}.dbtype").exists():
@@ -732,35 +800,27 @@ def main() -> int:
             }
         }
     }
-    query_json_path = out / f"{name}_query.json"
     query_json_path.write_text(json.dumps(query_json, indent=2))
     print(f"[query] wrote {query_json_path}")
 
     # ---- 3) Write the runner YAML
-    runner_yaml_path = out / "runner.yml"
     write_runner_yaml(runner_yaml_path, pairing=pairing)
     print(f"[runner] wrote {runner_yaml_path}")
 
+    if args.stage == "prepare":
+        print(f"[done] prepared MSAs and OpenFold inputs under {out}")
+        return 0
+
     # ---- 4) Invoke OpenFold 3 through uv
-    uv_prefix = build_uv_run_prefix(
+    run_openfold_prediction(
+        query_json_path=query_json_path,
+        runner_yaml_path=runner_yaml_path,
+        predictions_dir=predictions_dir,
+        query_name=name,
+        inference_ckpt_path=args.inference_ckpt_path,
         openfold_project=args.openfold_project,
         openfold_with=args.openfold_with,
     )
-    cmd = [
-        *uv_prefix,
-        "run_openfold",
-        "predict",
-        f"--query_json={query_json_path}",
-        "--use_msa_server=False",
-        f"--output_dir={predictions_dir}",
-        f"--runner_yaml={runner_yaml_path}",
-    ]
-    if args.inference_ckpt_path is not None:
-        cmd.append(f"--inference_ckpt_path={args.inference_ckpt_path}")
-
-    run(cmd)
-    validate_prediction_outputs(predictions_dir, expected_query_names=[name])
-    print(f"[done] predictions written under {predictions_dir}")
     return 0
 
 

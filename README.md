@@ -150,6 +150,20 @@ openfold --input_yaml input.yaml --output_dir results/ \
     --inference_ckpt_path /path/to/model.pt
 ```
 
+For batched runs, MSA preparation and MPS inference can be scheduled separately:
+
+```bash
+# CPU/MMseqs2 stage: writes alignments, query JSON and runner.yml
+openfold --input_yaml input.yaml --output_dir results/ --stage prepare
+
+# MPS stage: reuses those files without running MMseqs2 again
+openfold --input_yaml input.yaml --output_dir results/ --stage predict
+```
+
+`--stage all` is the default and preserves the original one-command workflow.
+Separating the stages is useful for a producer/consumer batch pipeline: MMseqs2
+can prepare upcoming jobs on CPU while a single OpenFold process owns MPS.
+
 The wrapper requires `run_openfold` to be available. By default it runs `uv run run_openfold predict ...` from the current directory. If OpenFold 3 is installed elsewhere, use one of:
 
 ```bash
